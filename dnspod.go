@@ -120,7 +120,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		if err != nil {
 			return addedRecords, err
 		}
-		addedRecords = append(addedRecords, p.toLibdnsRecord(created))
+		addedRecords = append(addedRecords, p.mergeCreated(libdnsRecord, created))
 	}
 
 	return addedRecords, nil
@@ -148,7 +148,7 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 			if err != nil {
 				return setRecords, err
 			}
-			setRecords = append(setRecords, p.toLibdnsRecord(created))
+			setRecords = append(setRecords, p.mergeCreated(libdnsRecord, created))
 			continue
 		}
 
@@ -162,10 +162,10 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 			if err != nil {
 				return setRecords, fmt.Errorf("update failed (%v) and fallback create also failed: %v", id, err)
 			}
-			setRecords = append(setRecords, p.toLibdnsRecord(created))
+			setRecords = append(setRecords, p.mergeCreated(libdnsRecord, created))
 			continue
 		}
-		setRecords = append(setRecords, p.toLibdnsRecord(updated))
+		setRecords = append(setRecords, p.mergeCreated(libdnsRecord, updated))
 	}
 
 	return setRecords, nil
@@ -185,6 +185,21 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		id := ""
 		if r, ok := libdnsRecord.(Record); ok {
 			id = r.ID
+		}
+		// callers (e.g. certmagic cleanup) often pass a plain libdns.RR
+		// without our wrapper, so look the record up by name+type+value.
+		if id == "" {
+			rr := libdnsRecord.RR()
+			remoteRecords, _, err := client.Records.List(domainID, rr.Name)
+			if err != nil {
+				return deletedRecords, err
+			}
+			for _, rec := range remoteRecords {
+				if rec.Name == rr.Name && rec.Type == rr.Type && rec.Value == rr.Data {
+					id = rec.ID
+					break
+				}
+			}
 		}
 		if id == "" {
 			continue
@@ -226,6 +241,22 @@ func (p *Provider) getDomainID(zone string) (string, error) {
 	return "", fmt.Errorf("domain %s not found", zone)
 }
 
+// mergeCreated builds the libdns Record returned to the caller. DNSPod's
+// Create/Update responses only populate ID (and sometimes Name), so the
+// Type/Value/TTL fields are taken from the original input record.
+func (p *Provider) mergeCreated(input libdns.Record, created dnspod.Record) libdns.Record {
+	rr := input.RR()
+	if created.Name != "" {
+		rr.Name = created.Name
+	}
+	if created.TTL != "" {
+		if ttl, err := strconv.Atoi(created.TTL); err == nil {
+			rr.TTL = time.Duration(ttl) * time.Second
+		}
+	}
+	return Record{ID: created.ID, base: rr}
+}
+
 func (p *Provider) toLibdnsRecord(record dnspod.Record) libdns.Record {
 	ttl, _ := strconv.Atoi(record.TTL)
 	return Record{
@@ -241,17 +272,25 @@ func (p *Provider) toLibdnsRecord(record dnspod.Record) libdns.Record {
 
 func (p *Provider) fromLibdnsRecord(record libdns.Record) dnspod.Record {
 	rr := record.RR()
-	dnspodRec := dnspod.Record{
+	// DNSPod rejects TTL "0" / TTLs below the account minimum (600 for free accounts).
+	// Certmagic creates ACME challenge records with TTL=0, so omit the field and
+	// let DNSPod apply its default.
+	ttl := ""
+	if seconds := int(rr.TTL.Seconds()); seconds > 0 {
+		ttl = strconv.Itoa(seconds)
+	}
+	// DNSPod expects the apex name as "@", not an empty string.
+	name := rr.Name
+	if name == "" {
+		name = "@"
+	}
+	return dnspod.Record{
 		Type:  rr.Type,
-		Name:  rr.Name,
+		Name:  name,
 		Value: rr.Data,
-		TTL:   fmt.Sprintf("%.0f", rr.TTL.Seconds()),
+		TTL:   ttl,
 		Line:  "默认",
 	}
-	// Note: We don't set ID here by default as it's often used for Create/Update attributes
-	// Note: dnspod-go Record.MX is used for priority.
-	// Since libdns.RR doesn't expose it, we'll just handle basic types.
-	return dnspodRec
 }
 
 // Interface guards
