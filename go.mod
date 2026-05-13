@@ -1,4 +1,4 @@
-module github.com/caddy-dns/dnspod
+module github.com/kkkgo/dnspod
 
 go 1.25.0
 
